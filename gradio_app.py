@@ -2,6 +2,7 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -52,6 +53,32 @@ def tail(f, window=20):
     return "\n".join("".join(data).splitlines()[-window:])
 
 
+def list_checkpoints():
+    default_path = os.path.join(os.path.dirname(__file__), "models", "Stable-diffusion")
+    # If args.checkpoint_dir is not specified, use the default path
+    path = default_path
+    if args.checkpoint_dir and os.path.exists(args.checkpoint_dir):
+        path = args.checkpoint_dir
+    os.makedirs(path, exist_ok=True)
+    # Enumerate all files in the checkpoint directory recursively
+    ckpts = {}
+    ckpt_base = os.path.basename(path)
+    for root, dirs, files in os.walk(path):
+        for file in files:
+            # Check if the file is a checkpoint
+            if file.endswith(".safetensors") or file.endswith(".ckpt"):
+                # Get the checkpoint path
+                ckpt_path = os.path.join(root, file)
+                ckpt_name = os.path.basename(ckpt_path)
+                # Strip the extension
+                ckpt_name = os.path.splitext(ckpt_name)[0]
+                ckpt_folder = os.path.basename(os.path.dirname(ckpt_path))
+                if ckpt_folder != ckpt_base:
+                    ckpt_name = "/".join([ckpt_folder, ckpt_name])
+                # Add the checkpoint to the list
+                ckpts[ckpt_name] = ckpt_path
+    return ckpts
+
 @dataclass
 class ExperimentStatus:
     pid: Optional[int] = None
@@ -73,6 +100,7 @@ class ExperimentStatus:
 
 
 EXP_ROOT_DIR = "outputs-gradio"
+
 DEFAULT_PROMPT = "a delicious hamburger"
 model_name_config = [
     ("SJC (Stable Diffusion)", "configs/gradio/sjc.yaml"),
@@ -182,8 +210,10 @@ def get_current_status(process, trial_dir, alive_path):
 
 def run(
     model_name: str,
+    checkpoint_name: str,
     config: str,
     prompt: str,
+    image: str,
     guidance_scale: float,
     seed: int,
     max_steps: int,
@@ -200,16 +230,22 @@ def run(
         f.write(config)
 
     # manually assign the output directory, name and tag so that we know the trial directory
+    temp_dir = EXP_ROOT_DIR
+    if args.temp_dir:
+        temp_dir = args.temp_dir
+        os.makedirs(temp_dir, exist_ok=True)
+        print(f"Using temp dir: {temp_dir}")
+
     name = os.path.basename(model_config[model_name]["path"]).split(".")[0]
     tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+    working_dir = os.path.join(temp_dir, name, tag)
     trial_dir = os.path.join(save_root, EXP_ROOT_DIR, name, tag)
-    alive_path = os.path.join(trial_dir, "alive")
+
+    alive_path = os.path.join(working_dir, "alive")
 
     # spawn the training process
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-    process = subprocess.Popen(
-        f"python launch.py --config {config_file.name} --train --gpu {gpu} --gradio trainer.enable_progress_bar=false".split()
-        + [
+    input_params = [
             f'name="{name}"',
             f'tag="{tag}"',
             f"exp_root_dir={os.path.join(save_root, EXP_ROOT_DIR)}",
@@ -219,6 +255,14 @@ def run(
             f"seed={seed}",
             f"trainer.max_steps={max_steps}",
         ]
+    if image and os.path.exists(image):
+        input_params.append(f"data.image_path={image}")
+
+    if checkpoint_name and os.path.exists(checkpoint_name):
+        input_params.append(f"resume={checkpoint_name}")
+    process = subprocess.Popen(
+        f"python launch.py --config {config_file.name} --train --gpu {gpu} --gradio trainer.enable_progress_bar=false".split()
+        + input_params
         + (
             ["checkpoint.every_n_train_steps=${trainer.max_steps}"] if save_ckpt else []
         ),
@@ -227,14 +271,14 @@ def run(
     # spawn the watcher process
     watch_process = subprocess.Popen(
         "python gradio_app.py watch".split()
-        + ["--pid", f"{process.pid}", "--trial-dir", f"{trial_dir}"]
+        + ["--pid", f"{process.pid}", "--trial-dir", f"{working_dir}"]
     )
 
     # update status (progress, log, image, video) every status_update_interval senconds
     # button status: Run -> Stop
     while process.poll() is None:
         time.sleep(status_update_interval)
-        yield get_current_status(process, trial_dir, alive_path).tolist() + [
+        yield get_current_status(process, working_dir, alive_path).tolist() + [
             gr.update(visible=False),
             gr.update(value="Stop", variant="stop", visible=True),
         ]
@@ -245,8 +289,16 @@ def run(
 
     # update status one last time
     # button status: Stop / Reset -> Run
-    status = get_current_status(process, trial_dir, alive_path)
+    status = get_current_status(process, working_dir, alive_path)
     status.progress = "Finished."
+    if trial_dir != working_dir:
+        # Move the contents of working_dir to trial_dir
+        os.makedirs(trial_dir, exist_ok=True)
+        for file in os.listdir(working_dir):
+            shutil.move(os.path.join(working_dir, file), trial_dir)
+        status.output_mesh = status.output_mesh.replace(working_dir, trial_dir)
+        status.output_image = status.output_image.replace(working_dir, trial_dir)
+        status.output_video = status.output_video.replace(working_dir, trial_dir)
     yield status.tolist() + [
         gr.update(value="Run", variant="primary", visible=True),
         gr.update(visible=False),
@@ -345,8 +397,16 @@ def launch(
                     label="Select a model",
                 )
 
+                ckpt_selector = gr.Dropdown(
+                    value="",
+                    choices=list_checkpoints(),
+                    label="Select a SD Checkpoint",
+                )
+
                 # prompt input
                 prompt_input = gr.Textbox(value=DEFAULT_PROMPT, label="Input prompt")
+
+                image_input = gr.Image(value=None, label="Input image")
 
                 # guidance scale slider
                 guidance_scale_input = gr.Slider(
@@ -400,6 +460,13 @@ def launch(
                     queue=False,
                 )
 
+                # ckpt_selector.change(
+                #     fn=on_ckpt_selector_change,
+                #     inputs=ckpt_selector,
+                #     outputs=[config_editor],
+                #     queue=False,
+                # )
+
                 run_btn = gr.Button(value="Run", variant="primary")
                 stop_btn = gr.Button(value="Stop", variant="stop", visible=False)
 
@@ -423,8 +490,10 @@ def launch(
             fn=run,
             inputs=[
                 model_selector,
+                ckpt_selector,
                 config_editor,
                 prompt_input,
+                image_input,
                 guidance_scale_input,
                 seed_input,
                 max_steps_input,
@@ -519,6 +588,8 @@ if __name__ == "__main__":
         parser.add_argument("--save-ckpt", action="store_true")  # unused
         parser.add_argument("--save-root", type=str, default=".")
         parser.add_argument("--port", type=int, default=7860)
+        parser.add_argument("--temp-dir", type=str, default=None)
+        parser.add_argument("--checkpoint-dir", type=str, default=None)
         args = parser.parse_args()
         launch(
             args.port,
