@@ -103,6 +103,7 @@ EXP_ROOT_DIR = "outputs-gradio"
 
 DEFAULT_PROMPT = "a delicious hamburger"
 model_name_config = [
+    ("ProlificDreamer (Experimental)", "configs/prolificdreamer.yaml"),
     ("SJC (Stable Diffusion)", "configs/gradio/sjc.yaml"),
     ("DreamFusion (DeepFloyd-IF)", "configs/gradio/dreamfusion-if.yaml"),
     ("DreamFusion (Stable Diffusion)", "configs/gradio/dreamfusion-sd.yaml"),
@@ -240,7 +241,8 @@ def run(
     tag = datetime.now().strftime("%Y%m%d-%H%M%S")
     working_dir = os.path.join(temp_dir, name, tag)
     trial_dir = os.path.join(save_root, EXP_ROOT_DIR, name, tag)
-
+    os.makedirs(working_dir, exist_ok=True)
+    os.makedirs(trial_dir, exist_ok=True)
     alive_path = os.path.join(working_dir, "alive")
 
     # spawn the training process
@@ -252,17 +254,20 @@ def run(
             "use_timestamp=false",
             f'system.prompt_processor.prompt="{prompt}"',
             f"system.guidance.guidance_scale={guidance_scale}",
-            "data.width = 64",
-            "data.height = 64",
             "data.batch_size = 1",
             f"seed={seed}",
             f"trainer.max_steps={max_steps}",
         ]
-    if image and os.path.exists(image):
-        input_params.append(f"data.image_path={image}")
+    if "ProlificDreamer" in model_name:
+        input_params.append("data.width = 64")
+        input_params.append("data.height = 64")
 
-    if checkpoint_name and os.path.exists(checkpoint_name):
-        input_params.append(f"system.guidance.pretrained_model_name_or_path_lora={checkpoint_name}")
+        if checkpoint_name and os.path.exists(checkpoint_name):
+            input_params.append(f"system.guidance.pretrained_model_name_or_path_lora={checkpoint_name}")
+
+        if image and os.path.exists(image):
+            input_params.append(f"data.image_path={image}")
+
 
     process = subprocess.Popen(
         f"python launch.py --config {config_file.name} --train --gpu {gpu} --gradio trainer.enable_progress_bar=false".split()
@@ -411,6 +416,18 @@ def launch(
                 prompt_input = gr.Textbox(value=DEFAULT_PROMPT, label="Input prompt")
 
                 image_input = gr.Image(value=None, label="Input image", type="filepath")
+
+                def update_inputs(model_name_sel):
+                    if "ProlificDreamer" in model_name_sel:
+                        return gr.update(visible=True)
+                    else:
+                        return gr.update(visible=True)
+
+                model_selector.change(
+                    fn=update_inputs,
+                    inputs=model_selector,
+                    outputs=[image_input],
+                )
 
                 # guidance scale slider
                 guidance_scale_input = gr.Slider(
