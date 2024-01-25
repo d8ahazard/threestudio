@@ -252,6 +252,9 @@ def run(
             "use_timestamp=false",
             f'system.prompt_processor.prompt="{prompt}"',
             f"system.guidance.guidance_scale={guidance_scale}",
+            "data.width = 64",
+            "data.height = 64",
+            "data.batch_size = 1",
             f"seed={seed}",
             f"trainer.max_steps={max_steps}",
         ]
@@ -259,7 +262,8 @@ def run(
         input_params.append(f"data.image_path={image}")
 
     if checkpoint_name and os.path.exists(checkpoint_name):
-        input_params.append(f"resume={checkpoint_name}")
+        input_params.append(f"system.guidance.pretrained_model_name_or_path_lora={checkpoint_name}")
+
     process = subprocess.Popen(
         f"python launch.py --config {config_file.name} --train --gpu {gpu} --gradio trainer.enable_progress_bar=false".split()
         + input_params
@@ -406,7 +410,7 @@ def launch(
                 # prompt input
                 prompt_input = gr.Textbox(value=DEFAULT_PROMPT, label="Input prompt")
 
-                image_input = gr.Image(value=None, label="Input image")
+                image_input = gr.Image(value=None, label="Input image", type="filepath")
 
                 # guidance scale slider
                 guidance_scale_input = gr.Slider(
